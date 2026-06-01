@@ -1,118 +1,121 @@
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include <PubSubClient.h>
+#include <time.h>
+#include <WiFiClientSecure.h>
 
-const char* ssid = "BSI-UAD";
+// Update ini sesuai dengan jaringan wifi harianmu
+const char* ssid = "Redmi Note 11";
+const char* password = "12345678";
+const char* mqtt_server = "931710ae580f46e3b0f17196c1c834f8.s1.eu.hivemq.cloud";
 
-// Global Variabel untuk menyimpan state dan data antar-loop
-String dynamicURL = "";
-bool statusInternetTerakhir = false;
+WiFiClientSecure espClient;
+PubSubClient * client; 
+
+unsigned long lastMsg = 0;
+#define MSG_BUFFER_SIZE (500)
+char msg[MSG_BUFFER_SIZE];
+
+// Interval pengiriman data tracking (1000 ms = 1 detik sekali)
+// Kamu bisa sesuaikan, untuk robot bergerak cepat biasanya 500ms - 1000ms adalah ideal
+const unsigned long intervalTracking = 1000; 
+
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  randomSeed(micros());
+  Serial.println("\nWiFi connected");
+}
+
+void setDateTime() {
+  configTime(25200, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Waiting for NTP time sync: ");
+  time_t now = time(nullptr);
+  while (now < 8 * 3600 * 2) {
+    delay(100);
+    Serial.print(".");
+    now = time(nullptr);
+  }
+  Serial.println("\nTime synchronized!");
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  // Tempat menerima instruksi balik dari Base Station ke Robot jika ada
+}
+
+void reconnect() {
+  while (!client->connected()) {
+    Serial.print("Attempting MQTT connection...");
+    String clientId = "Senagarda-Rover-" + String(random(0, 0xffff), HEX);
+    
+    if (client->connect(clientId.c_str(), "rover_user", "Senagarda1")) {
+      Serial.println("connected");
+      // Subscribe ke topik perintah jika robot butuh dikendalikan jarak jauh lewat MQTT
+      client->subscribe("rover/command"); 
+    } else {
+      Serial.print("failed, rc = ");
+      Serial.print(client->state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
 
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid);
-  
-  Serial.println("\n=======================================");
-  Serial.print("[1/2] Menghubungkan ke Radio Wi-Fi: ");
-  Serial.println(ssid);
+  delay(500);
+  Serial.begin(115200); 
+  delay(500);
+
+  setup_wifi();
+  setDateTime();
+
+  espClient.setInsecure(); 
+
+  client = new PubSubClient(espClient);
+  client->setServer(mqtt_server, 8883);
+  client->setCallback(callback);
 }
 
 void loop() {
-  // 1. Pastikan koneksi fisik Wi-Fi aman
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    statusInternetTerakhir = false;
-    dynamicURL = ""; // Reset URL jika koneksi putus
-    delay(1000);
-    return;
+  if (!client->connected()) {
+    reconnect();
   }
+  client->loop();
 
-  // 2. Cek Akses Internet Nyata (Ping Test)
-  bool statusInternetSekarang = cekAksesInternet();
+  unsigned long now = millis();
+  
+  // Masuk ke fase pengiriman kontinu untuk tracking setiap interval tercapai
+  if (now - lastMsg > intervalTracking) {
+    lastMsg = now;
 
-  // JIKA TERJEBAK DI LOGIN PAGE (Internet mati, tapi fisik konek)
-  if (!statusInternetSekarang) {
-    statusInternetTerakhir = false;
+    // ------------------------------------------------======================
+    // TIP ROBOTIKA: Ganti nilai statis ini dengan pembacaan sensor GPS aslimu
+    // Misalnya: latitude = gps.location.lat();
+    // ------------------------------------------------======================
+    float latitude  = -7.801389;  
+    float longitude = 110.384444;
+    float altitude  = 114.50;
     
-    // STATE A: Jika belum punya URL dinamis, ambil dulu token segarnya
-    if (dynamicURL == "") {
-      Serial.println("\n[2/2] >>> STATUS: TERTINGGAL DI LOGIN PAGE! <<<");
-      ambilURLDinamis();
-      delay(2000); // Beri jeda waktu yang aman bagi FreeRTOS untuk membersihkan queue socket
-    } 
-    // STATE B: Jika URL dinamis sudah siap di memori, eksekusi nembak payload
-    else {
-      Serial.println("[PROSES] Menembak payload menggunakan URL Dinamis Baru...");
-      tembakPayloadLogin();
-      delay(4000); // Tunggu proses autentikasi sistem kampus
-    }
-  } 
-  // JIKA BYPASS SUKSES & INTERNET AKTIF
-  else {
-    if (statusInternetTerakhir == false) {
-      Serial.println("\n>>> STATUS: BYPASS SUKSES! INTERNET AKTIF <<<");
-      Serial.print("[INFO] IP Address ESP32: ");
-      Serial.println(WiFi.localIP());
-      statusInternetTerakhir = true;
-    }
-    delay(5000); // Jika sudah internetan, cek ulang berkala setiap 5 detik saja
+    // Membungkus data koordinat ke format JSON string
+    snprintf(msg, MSG_BUFFER_SIZE, 
+            "{\"lat\":%.6f,\"lng\":%.6f,\"alt\":%.2f}", 
+            latitude, longitude, altitude);
+            
+    // Cetak ke Serial Monitor untuk memantau pergerakan data sebelum dikirim
+    Serial.print("Live Tracking -> ");
+    Serial.println(msg);
+    
+    // Kirim secara real-time ke topik khusus lokasi robot
+    client->publish("rover/present_location", msg);
   }
-}
-
-// FUNGSI PING INTERNET
-bool cekAksesInternet() {
-  HTTPClient http;
-  http.begin("http://connectivitycheck.gstatic.com/generate_204");
-  http.setTimeout(1500);
-  int httpCode = http.GET();
-  http.end();
-  return (httpCode == 204);
-}
-
-// FUNGSI AMBIL URL DAN TOKEN (FASE 1)
-void ambilURLDinamis() {
-  HTTPClient http;
-  Serial.println("[PROSES] Mengambil token baru dari gateway...");
-  http.begin("http://2.2.2.2/");
-  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-  
-  const char* headerKeys[] = {"Location"};
-  http.collectHeaders(headerKeys, 1);
-  
-  int initialCode = http.GET();
-  if (initialCode == 302 && http.hasHeader("Location")) {
-    dynamicURL = http.header("Location");
-    Serial.println("[SUKSES] Mendapatkan URL Dinamis Baru.");
-  } else {
-    Serial.println("[GAGAL] Gateway tidak merespon 302. Mencoba lagi loop depan.");
-  }
-  http.end();
-}
-
-// FUNGSI TEMBAK PAYLOAD LOGIN (FASE 2)
-void tembakPayloadLogin() {
-  HTTPClient http;
-  http.begin(dynamicURL);
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS); // Matikan follow redirect demi hemat RAM
-  
-  String httpRequestData = "RequestType=Login"
-                           "&UE-Username=2315022033"
-                           "&UE-Password=uputuput"
-                           "&button=Sign+In";
-  
-  int httpResponseCode = http.POST(httpRequestData);
-  
-  if (httpResponseCode > 0) {
-    Serial.print("[RESPON SERVER KAMPUS]: ");
-    Serial.println(httpResponseCode);
-  } else {
-    Serial.print("[ERROR HTTP]: ");
-    Serial.println(http.errorToString(httpResponseCode).c_str());
-  }
-  
-  http.end();
-  dynamicURL = ""; // Reset kembali setelah digunakan agar loop depan mengambil token baru jika gagal
 }
